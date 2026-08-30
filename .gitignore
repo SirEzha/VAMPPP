@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.wav
+*.mp3
+*.ogg
+!data/refs/*.wav
+.ipynb_checkpoints/
