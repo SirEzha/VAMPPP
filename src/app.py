@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+import librosa
 import numpy as np
 import sounddevice as sd
 import tkinter as tk
@@ -18,6 +19,41 @@ from tkinter import filedialog, messagebox, ttk
 
 from src.api import PronunciationScorer, ScoreResult, get_encoder, score
 from src.audio import load_audio
+
+# The scoring pipeline always runs at 16 kHz, but the sound card need not accept it.
+# PortAudio talks to raw ALSA hw: devices, which expose no resampler, so an
+# unsupported rate raises paInvalidSampleRate rather than being converted. Device
+# I/O therefore runs at a hardware rate and is resampled on the way in and out.
+MODEL_SR = 16000
+_CANDIDATE_RATES = (48000, 44100, 32000, 22050, 16000)
+
+
+def pick_device_samplerate(device: Optional[int], kind: str) -> int:
+    """Return a sample rate `device` actually supports, preferring its own default."""
+    check = sd.check_input_settings if kind == "input" else sd.check_output_settings
+    candidates = []
+    try:
+        candidates.append(int(sd.query_devices(device, kind)["default_samplerate"]))
+    except Exception:
+        pass
+    candidates.extend(_CANDIDATE_RATES)
+
+    for rate in dict.fromkeys(candidates):
+        try:
+            check(device=device, samplerate=rate, channels=1)
+            return rate
+        except Exception:
+            continue
+    raise RuntimeError(f"No supported sample rate for {kind} device {device!r}")
+
+
+def resample(wav: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample mono float32 audio, passing it through untouched when rates match."""
+    if orig_sr == target_sr:
+        return wav.astype(np.float32)
+    return librosa.resample(
+        wav.astype(np.float32), orig_sr=orig_sr, target_sr=target_sr
+    ).astype(np.float32)
 
 
 class VoiceSimilarityApp:
@@ -37,6 +73,7 @@ class VoiceSimilarityApp:
         self.ref_audio_path: Optional[str] = None
         self.live_audio_data: Optional[np.ndarray] = None
         self.is_recording = False
+        self.record_sr = MODEL_SR
         self.recording_thread: Optional[threading.Thread] = None
         self.recorded_chunks: List[np.ndarray] = []
         self.record_start_time: float = 0.0
@@ -243,7 +280,8 @@ class VoiceSimilarityApp:
             self.scorer = PronunciationScorer()
             self._safe_after(lambda: self.status_var.set("Model ready."))
         except Exception as e:
-            self._safe_after(lambda: self.status_var.set(f"Engine init: {e}"))
+            msg = str(e)
+            self._safe_after(lambda: self.status_var.set(f"Engine init: {msg}"))
 
     def refresh_audio_devices(self):
         """Query and populate available audio input devices."""
@@ -298,14 +336,20 @@ class VoiceSimilarityApp:
 
         self.status_var.set(f"Loaded reference: {os.path.basename(path)}")
 
+    def _play_array(self, wav: np.ndarray, sr: int = MODEL_SR):
+        """Play mono audio, resampling to whatever the output device accepts."""
+        device = sd.default.device[1]
+        out_sr = pick_device_samplerate(device, "output")
+        sd.stop()
+        sd.play(resample(wav, sr, out_sr), samplerate=out_sr, device=device)
+
     def play_reference_audio(self):
         """Play selected reference audio file."""
         if not self.ref_audio_path:
             return
         try:
             wav, sr = load_audio(self.ref_audio_path)
-            sd.stop()
-            sd.play(wav, samplerate=sr)
+            self._play_array(wav, sr)
         except Exception as e:
             messagebox.showerror("Playback Error", f"Could not play audio: {e}")
 
@@ -314,8 +358,7 @@ class VoiceSimilarityApp:
         if self.live_audio_data is None:
             return
         try:
-            sd.stop()
-            sd.play(self.live_audio_data, samplerate=16000)
+            self._play_array(self.live_audio_data, MODEL_SR)
         except Exception as e:
             messagebox.showerror("Playback Error", f"Could not play audio: {e}")
 
@@ -379,8 +422,9 @@ class VoiceSimilarityApp:
     def _record_worker(self, device_id: Optional[int]):
         """Stream callback background worker."""
         try:
+            self.record_sr = pick_device_samplerate(device_id, "input")
             with sd.InputStream(
-                samplerate=16000,
+                samplerate=self.record_sr,
                 channels=1,
                 dtype="float32",
                 device=device_id,
@@ -389,8 +433,15 @@ class VoiceSimilarityApp:
                     chunk, _ = stream.read(1024)
                     self.recorded_chunks.append(chunk.copy())
         except Exception as e:
-            self._safe_after(lambda: messagebox.showerror("Recording Error", str(e)))
+            msg = str(e)
             self.is_recording = False
+            self._safe_after(lambda: self._on_record_error(msg))
+
+    def _on_record_error(self, msg: str):
+        """Surface a capture failure and return the button to its idle state."""
+        self.btn_record.configure(text="● Start Recording")
+        self.status_var.set("Recording failed.")
+        messagebox.showerror("Recording Error", msg)
 
     def _update_record_timer(self):
         """Update live recording seconds label."""
@@ -399,7 +450,7 @@ class VoiceSimilarityApp:
             mins = elapsed // 60
             secs = elapsed % 60
             self.rec_time_var.set(f"● {mins:02d}:{secs:02d}")
-            self._safe_after(lambda: self.root.after(250, self._update_record_timer))
+            self.root.after(250, self._update_record_timer)
         else:
             self.rec_time_var.set("")
 
@@ -414,7 +465,7 @@ class VoiceSimilarityApp:
             return
 
         full_audio = np.concatenate(self.recorded_chunks, axis=0).flatten()
-        self.live_audio_data = full_audio.astype(np.float32)
+        self.live_audio_data = resample(full_audio, self.record_sr, MODEL_SR)
         self.btn_play_live.configure(state="normal")
 
         self.run_scoring_pipeline()
@@ -455,7 +506,8 @@ class VoiceSimilarityApp:
 
             self._safe_after(lambda: self._display_results(res, elapsed))
         except Exception as e:
-            self._safe_after(lambda: self._on_score_error(e))
+            err = e
+            self._safe_after(lambda: self._on_score_error(err))
 
     def _display_results(self, res: ScoreResult, elapsed_sec: float):
         """Render computed scores and table details."""
